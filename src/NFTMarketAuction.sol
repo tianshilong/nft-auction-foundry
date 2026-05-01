@@ -296,48 +296,54 @@ contract NFTMarketAuction is Initializable, UUPSUpgradeable, OwnableUpgradeable,
      * @param _amount    出价金额（代币最小单位），ETH 出价时必须与 msg.value 一致
      */
     function placeBid (uint256 _auctionId,uint256 _amount) 
-    external 
-    auctionState(_auctionId, State.Active)
-    auctionTime(_auctionId)
-    auctionExists(_auctionId) 
-    payable {
-        Auction storage auction = auctions[_auctionId];
-        // 卖家不能给自己的拍卖出价
-        require(msg.sender != auction.seller, "Seller cannot bid");
+        external 
+        auctionState(_auctionId, State.Active)
+        auctionTime(_auctionId)
+        auctionExists(_auctionId) 
+        payable {
+            Auction storage auction = auctions[_auctionId];
+            // 卖家不能给自己的拍卖出价
+            require(msg.sender != auction.seller, "Seller cannot bid");
 
+            address bidToken = auction.bidToken;
+            uint256 receivedAmount;
+
+            if (bidToken == address(0)) {
+                // ETH 出价
+                // 发送的 ETH 必须与 _amount 参数一致
+                 require(msg.value == _amount, "ETH amount mismatch");
+                require(msg.value > 0, "Bid must be > 0");
+                receivedAmount = msg.value;
+            } else {
+                // ERC20 出价
+                require(msg.value == 0, "No ETH");
+                require(_amount > 0, "Bid amount must be > 0");
+                IERC20Metadata token = IERC20Metadata(bidToken);
+                require(token.allowance(msg.sender, address(this)) >= _amount, "Allowance too low");
+                require(token.transferFrom(msg.sender, address(this), _amount), "Transfer failed");
+                receivedAmount = _amount;
+            }
+
+           (uint256 usdValue, address previousBidder, uint256 previousAmount) = _evaluateBid(auction, receivedAmount);
+
+            // 更新最高出价信息
+            auction.highestBidder = msg.sender;
+            auction.highestBid = receivedAmount;
+            auction.highestBidValueUsd = usdValue;    // 记录
+
+            // 如果之前有出价者，将其出价金额加入待退款池
+            if (previousBidder != address(0)) {
+                pendingRefunds[previousBidder][bidToken] += previousAmount;
+            }
+
+            // 发出出价事件
+            emit BidPlaced(_auctionId, msg.sender, receivedAmount, usdValue);
+    }
+
+    function _evaluateBid(Auction storage auction, uint256 receivedAmount) private view returns (uint256 usdValue, address previousBidder, uint256 previousAmount) {
         address bidToken = auction.bidToken;
-        uint256 receivedAmount;
-        uint256 usdValue;
 
-        if (bidToken == address(0)) {
-            // ETH 出价
-            // 发送的 ETH 必须与 _amount 参数一致
-            require(msg.value == _amount, "ETH amount mismatch");
-            require(msg.value > 0, "Bid must be > 0");
-            receivedAmount = msg.value;
-            // 获取 ETH/USD 价格并计算美元价值
-            uint256 ethPrice = getPriceInUsd(address(ethUsdPriceFeed));
-            usdValue = convertToUsdValue(receivedAmount, 18, ethPrice);
-        } else {
-            // ERC20 出价
-            require(msg.value == 0, "No ETH");
-            require(_amount > 0, "Bid amount must be > 0");
-            // 获取代币接口，检查授权并转移代币
-            IERC20Metadata token = IERC20Metadata(bidToken);
-            require(token.allowance(msg.sender, address(this)) >= _amount, "Allowance too low");
-            require(token.transferFrom(msg.sender, address(this), _amount), "Transfer failed");
-
-            receivedAmount = _amount;
-
-            // 确定价格预言机地址：优先使用拍卖专用，否则使用全局
-            address priceFeed = auction.erc20PriceFeed != address(0) ? auction.erc20PriceFeed : address(erc20UsdPriceFeed);
-            uint256 erc20Price = getPriceInUsd(priceFeed);
-            uint8 tokenDecimals = token.decimals();
-            usdValue = convertToUsdValue(receivedAmount, tokenDecimals, erc20Price);
-        }
-
-        // --- 统一用当前价格计算并比较美元价值 ---
-        // 1. 获取本次出价对应的代币价格
+        // 获取当前价格
         uint256 currentPrice;
         if (bidToken == address(0)) {
             currentPrice = getPriceInUsd(address(ethUsdPriceFeed));
@@ -346,36 +352,26 @@ contract NFTMarketAuction is Initializable, UUPSUpgradeable, OwnableUpgradeable,
             currentPrice = getPriceInUsd(priceFeed);
         }
 
-        // 2. 计算出价代币的小数位数
+        // 代币小数位数
         uint256 decimals = bidToken == address(0) ? 18 : IERC20Metadata(bidToken).decimals();
 
-        // 3. 计算起拍价当前对应的美元价值
+        // 计算本次出价的美元价值
+        usdValue = convertToUsdValue(receivedAmount, decimals, currentPrice);
+
+        // 起拍价门槛
         uint256 startPriceUsd = convertToUsdValue(auction.startPrice, decimals, currentPrice);
         require(usdValue >= startPriceUsd, "Bid below start price");
 
-        // 4. 重新计算当前最高出价在现价下的美元价值（确保与本次出价在同一价格基准下比较）
+        // 与当前最高出价比较（用统一价格重算）
         uint256 currentHighestUsd = 0;
         if (auction.highestBidder != address(0)) {
             currentHighestUsd = convertToUsdValue(auction.highestBid, decimals, currentPrice);
         }
         require(usdValue > currentHighestUsd, "Bid too low in USD value");
 
-        // --- 记录退回之前最高出价的资金 ---
-        address previousBidder = auction.highestBidder;
-        uint256 previousAmount = auction.highestBid;
-
-        // 更新最高出价信息
-        auction.highestBidder = msg.sender;
-        auction.highestBid = receivedAmount;
-        auction.highestBidValueUsd = usdValue;    // 记录
-
-         // 如果之前有出价者，将其出价金额加入待退款池
-        if (previousBidder != address(0)) {
-            pendingRefunds[previousBidder][bidToken] += previousAmount;
-        }
-
-        // 发出出价事件
-        emit BidPlaced(_auctionId, msg.sender, receivedAmount, usdValue);
+        // 返回旧最高出价者及其出价额，以便外部处理退款
+        previousBidder = auction.highestBidder;
+        previousAmount = auction.highestBid;
     }
 
     /**
