@@ -18,8 +18,7 @@ contract DeployAuctionUUPS is Script {
 
     function setUp() public {}
 
-    function run() external returns (address) {
-        // 确定预言机地址
+        function run() external returns (address) {
         (address ethFeed, address erc20Feed) = getPriceFeeds();
 
         vm.startBroadcast();
@@ -35,6 +34,14 @@ contract DeployAuctionUUPS is Script {
         // 3. 代理
         ERC1967Proxy proxyContract = new ERC1967Proxy(address(v1), initData);
         proxy = address(proxyContract);
+
+        // 验证初始化成功：检查预言机地址
+        require(
+            address(NFTMarketAuction(proxy).ethUsdPriceFeed()) == ethFeed &&
+            address(NFTMarketAuction(proxy).erc20UsdPriceFeed()) == erc20Feed,
+            "Initialization failed: feed address mismatch"
+        );
+
         console.log("Proxy deployed:", proxy);
 
         // 4. 部署 V2 并升级
@@ -45,13 +52,20 @@ contract DeployAuctionUUPS is Script {
         // 5. 初始化 V2
         NFTMarketAuctionV2(proxy).initializeV2(100);
 
+        // ★ 刷新 Mock 预言机时间戳（避免 stale price）
+        if (block.chainid == 31337) {
+            MockV3Aggregator(ethFeed).updateAnswer(2000e8);
+            MockV3Aggregator(erc20Feed).updateAnswer(1e8);
+            console.log("Mock feeds timestamp updated");
+        }
+
         vm.stopBroadcast();
 
         console.log("EthFeed used:", ethFeed);
         console.log("Erc20Feed used:", erc20Feed);
         return proxy;
     }
-
+    
     // ---------- 根据链 ID 自动选择预言机 ----------
     function getPriceFeeds() internal returns (address ethFeed, address erc20Feed) {
         uint256 chainId = block.chainid;
